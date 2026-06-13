@@ -531,3 +531,71 @@ def _trim_ids(obj: Any, max_ids: int = 10) -> Any:
     if isinstance(obj, list):
         return [_trim_ids(item, max_ids) for item in obj]
     return obj
+def synthesize_response_stream(
+    client: genai.Client,
+    user_query: str,
+    api_data: dict[str, Any],
+    intent_meta: dict,
+    stream_placeholder,
+):
+    """Stream the Gemini synthesis into a Streamlit placeholder.
+
+    Returns the full assembled text string when complete.
+    """
+    data_block = json.dumps(api_data, indent=2)
+
+    prompt = f"""You are an intelligent senior analytics assistant for the Grow-Matic admin dashboard.
+You receive raw API data and a manager's question. Produce a clear, concise, executive-level textual summary.
+
+Formatting rules:
+- Present numeric statistics in Markdown Tables if there are multiple comparison items (e.g. lists of app versions, tenant configurations, or user leaderboards), which makes metrics much easier to read.
+- Use plain text with light markdown (bold for key figures, bullet lists for multiple items).
+- Lead with the most important insight or direct answer.
+- Include specific numbers and percentages where available.
+- Highlight risks or anomalies a manager should act on.
+- End with one actionable recommendation if appropriate.
+- Keep the response under 400 words unless the data genuinely warrants more.
+- Do NOT repeat raw JSON or mention technical implementation details (like endpoints, methods, or database queries).
+- If an endpoint returned cached data, summarize it normally without mentioning the word "mock" or "cached fallback" in the final summary.
+
+Manager's question: "{user_query}"
+Routing context: {intent_meta.get("reasoning", "")}
+
+Raw API data:
+```json
+{data_block}
+```
+
+Provide a clear, executive-level answer and also deduce meaningfull insights from this data."""
+
+    full_text = ""
+    rendered_placeholder = stream_placeholder.empty()
+
+    for chunk in client.models.generate_content_stream(
+        model=GEMINI_MODEL,
+        contents=prompt,
+    ):
+        if chunk.text:
+            full_text += chunk.text
+            # Parse markdown directly to HTML for real-time preview
+            html_preview = markdown.markdown(full_text, extensions=['tables', 'fenced_code'])
+            rendered_placeholder.markdown(
+                f'<div class="bubble bot-bubble" style="max-width:100%;">{html_preview}</div>',
+                unsafe_allow_html=True,
+            )
+
+    rendered_placeholder.empty()  # will be re-rendered properly in chat history
+    return full_text
+def get_overall_data_source(api_data: dict) -> str:
+    """Determine overall data source from api_data outcomes."""
+    if not api_data:
+        return "none"
+    sources = [v.get("__data_source__") for v in api_data.values() if isinstance(v, dict)]
+    if "cached" in sources:
+        return "cached"
+    if "error" in sources:
+        return "error"
+    if "live" in sources:
+        return "live"
+    return "none"
+
