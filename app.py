@@ -18,6 +18,9 @@ import requests
 import markdown
 from google import genai
 from google.genai import types
+from dotenv import load_dotenv
+import os
+load_dotenv()
 APIS: dict[str, str] = {
     "high_battery_usage_count":         "https://admin-dashboard.grow-matic.com/api/v1/dashboard/high-battery-usage-count",
     "good_usage_onoff_duty_count":      "https://admin-dashboard.grow-matic.com/api/v1/dashboard/good-usage-onoff-duty-count",
@@ -599,3 +602,359 @@ def get_overall_data_source(api_data: dict) -> str:
         return "live"
     return "none"
 
+def run_pipeline(
+    client: genai.Client,
+    user_query: str,
+    tenant_id: str,
+    date_range_days: int,
+    page_size: int,
+    status_callback=None,
+    stream_placeholder=None,
+    force_cached: bool = False,
+) -> tuple[str, dict]:
+    """Execute the 3-step pipeline. Returns (final_text, debug_info)."""
+
+    debug: dict[str, Any] = {}
+
+    # ── Step 1: Intent Mapping ──
+    if status_callback:
+        status_callback("step1", "🔍 Analysing your question…")
+    intent = map_intent_to_apis(client, user_query, tenant_id, date_range_days)
+    debug["intent"] = intent
+    endpoints = intent.get("endpoints", [])
+
+    if not endpoints:
+        return (
+            "I wasn't able to match your question to any of the available API endpoints. "
+            "Try asking about GPS sessions, battery usage, app versions, tenant counts, "
+            "or notification events.",
+            {"intent": intent, "api_data": {}, "answer": ""},
+        )
+
+    # ── Step 2: Data Fetching ──
+    if status_callback:
+        ep_list = ", ".join(f"`{e}`" for e in endpoints)
+        status_callback("step2", f"📡 Fetching data from: {ep_list}…")
+    api_data = fetch_api_data(endpoints, tenant_id, date_range_days, page_size, force_cached)
+    debug["api_data"] = api_data
+
+    # ── Step 3: Response Synthesis (streaming) ──
+    if status_callback:
+        status_callback("step3", "✨ Synthesising your answer…")
+    answer = synthesize_response_stream(client, user_query, api_data, intent, stream_placeholder)
+    debug["answer"] = answer
+
+    return answer, debug
+
+
+# ---------------------------------------------------------------------------
+# ── Suggested quick questions ──────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+SUGGESTED_QUESTIONS = [
+    "How many sessions had missing GPS this month?",
+    "Which app versions are users running?",
+    "Show me the top users who were most on duty.",
+    "How many sessions started with low battery?",
+    "What is the state of our tenant configurations?",
+    "Are there any bad app settings I should be aware of?",
+    "How many GPS tracking notifications were sent recently?",
+    "What's the current cumulative tenant growth trend?",
+]
+def render_sidebar() -> tuple[str, str, int, int, bool, bool]:
+    """Render sidebar. Returns (api_key, tenant_id, days, page_size, debug_mode, force_cached)."""
+    with st.sidebar:
+        st.markdown("### 🌱 Grow-Matic Intelligence")
+        st.markdown("---")
+
+        # ── Toggle for offline mode ──
+        force_cached = st.toggle("💾 Force Offline/Cached Data", value=False, key="force_cached_toggle")
+        
+        # ── User Profile ──
+        profile = load_user_profile(force_cached=force_cached)
+        display_name = profile.get("displayName", "Administrator")
+        email = profile.get("email", "admin@grow-matic.com")
+        avatar_url = profile.get("avatar", "")
+
+        profile_html = f"""
+        <div style="display: flex; align-items: center; gap: 12px; background: var(--bg-card); padding: 12px; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 15px; box-shadow: var(--shadow);">
+            <img src="{avatar_url if avatar_url else 'https://www.gravatar.com/avatar/00000000000000000000000000000000?d=mp&f=y'}" style="width: 42px; height: 42px; border-radius: 50%; border: 2px solid var(--accent-green);" />
+            <div style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.3;">
+                <div style="font-weight: 700; font-size: 0.85rem; color: var(--text-primary);">{display_name}</div>
+                <div style="font-size: 0.72rem; color: var(--text-muted);">{email}</div>
+            </div>
+        </div>
+        """
+        st.markdown(profile_html, unsafe_allow_html=True)
+        st.markdown("---")
+
+        # ── Gemini API Key ──
+        # ── Gemini API Key ──
+        st.markdown("#### 🔑 Gemini API Key")
+
+        api_key = os.getenv("GEMINI_API_KEY", "")
+
+        if api_key:
+            st.success("✅ API key loaded from .env")
+        else:
+            st.error("❌ GEMINI_API_KEY not found in .env")
+        st.markdown("---")
+
+        # ── Cookie auth indicator ──
+        st.markdown("#### 🍪 Backend Auth")
+        st.markdown(
+            "<div class='metric-card' style='border-color:#10b981;'>"
+            "<div class='metric-label'>Session cookies</div>"
+            "<div class='metric-value' style='font-size:0.85rem; color:#10b981;'>✅ Authenticated</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("---")
+
+        # ── Tenant Selection dropdown ──
+        st.markdown("#### 🏢 Tenant Settings")
+        tenant_options = load_tenant_options(force_cached=force_cached)
+        
+        # Default index helper
+        default_idx = 0
+        for idx, (tid, _) in enumerate(tenant_options):
+            if tid == "370":
+                default_idx = idx
+                break
+
+        selected_tenant = st.selectbox(
+            "Select Active Tenant",
+            options=tenant_options,
+            index=default_idx,
+            format_func=lambda x: x[1],
+            key="sidebar_tenant_selectbox",
+        )
+        tenant_id = selected_tenant[0]
+
+        date_range_days = st.slider(
+            "Date Range (days)", min_value=1, max_value=90, value=30,
+            step=1, key="sidebar_date_range",
+        )
+        page_size = st.slider(
+            "Max records per endpoint", min_value=10, max_value=200,
+            value=50, step=10, key="sidebar_page_size",
+        )
+
+        st.markdown("---")
+
+        debug_mode = st.toggle("🔬 Show debug info", value=False, key="sidebar_debug")
+
+        st.markdown("---")
+
+        # ── Session stats ──
+        st.markdown("#### 📊 Session Stats")
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">Messages this session</div>
+                <div class="metric-value">{len(st.session_state.get("messages", []))}</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Active tenant ID</div>
+                <div class="metric-value">{tenant_id}</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Date window</div>
+                <div class="metric-value">Last {date_range_days}d</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("---")
+        if st.button("🗑️ Clear chat", use_container_width=True, key="clear_chat_btn"):
+            st.session_state.messages = []
+            st.session_state.debug_data = []
+            st.rerun()
+
+        st.markdown(
+            f"<div style='font-size:0.7rem;color:#9ca3af;text-align:center;margin-top:12px;'>"
+            f"Powered by Gemini ({GEMINI_MODEL}) · Grow-Matic v1.0"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+    return api_key, tenant_id, date_range_days, page_size, debug_mode, force_cached
+
+
+# ---------------------------------------------------------------------------
+# ── Chat message renderer ──────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def render_message(role: str, content: str, timestamp: str = "", data_source: str = ""):
+    """Render a single chat bubble."""
+    if role == "user":
+        html = f"""
+        <div class="msg-row user">
+            <div class="avatar user-av">👤</div>
+            <div>
+                <div class="bubble user-bubble">{content}</div>
+                <div class="msg-ts" style="text-align: right;">{timestamp}</div>
+            </div>
+        </div>"""
+    else:
+        # Format markdown dynamically using full markdown library (handles tables, fenced code, etc.)
+        rendered = markdown.markdown(content, extensions=['tables', 'fenced_code'])
+        
+        # Render dynamic badge for data source
+        badge_html = ""
+        if data_source == "live":
+            badge_html = '<span style="background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.3); padding: 2px 8px; border-radius: 20px; font-size: 0.68rem; font-weight: 600; margin-left: 8px; display: inline-flex; align-items: center; gap: 4px;">📡 Live Data</span>'
+        elif data_source == "cached":
+            badge_html = '<span style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.3); padding: 2px 8px; border-radius: 20px; font-size: 0.68rem; font-weight: 600; margin-left: 8px; display: inline-flex; align-items: center; gap: 4px;">💾 Cached Data (Fallback)</span>'
+        
+        html = f"""
+        <div class="msg-row">
+            <div class="avatar bot-av">🌱</div>
+            <div>
+                <div class="bubble bot-bubble">{rendered}</div>
+                <div class="msg-ts" style="display: flex; align-items: center; justify-content: flex-end; gap: 8px;">
+                    {timestamp} {badge_html}
+                </div>
+            </div>
+        </div>"""
+
+    st.markdown(html, unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# ── Main ────────────────------------------------------------------------───
+# ---------------------------------------------------------------------------
+
+def main():
+    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+    api_key, tenant_id, date_range_days, page_size, debug_mode, force_cached = render_sidebar()
+
+    # ── Header ──
+    st.markdown(
+        """
+        <div class="brand-header">
+            <div class="brand-icon">🌱</div>
+            <div>
+                <div class="brand-title">Grow-Matic Admin Intelligence</div>
+                <div class="brand-sub">Ask anything about application health, sessions, GPS, battery, tenants &amp; more</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── Session state ──
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "debug_data" not in st.session_state:
+        st.session_state.debug_data = []
+
+    # ── Suggested questions (only when chat is empty) ──
+    if not st.session_state.messages:
+        st.markdown("#### 💡 Try asking…")
+        cols = st.columns(4)
+        for idx, q in enumerate(SUGGESTED_QUESTIONS):
+            with cols[idx % 4]:
+                if st.button(q, key=f"sq_{idx}", use_container_width=True):
+                    st.session_state["pending_query"] = q
+        st.markdown("---")
+
+    # ── Render chat history ──
+    if st.session_state.messages:
+        st.markdown('<div class="chat-container">', unsafe_allow_html=True)
+        for i, msg in enumerate(st.session_state.messages):
+            render_message(msg["role"], msg["content"], msg.get("ts", ""), msg.get("data_source", ""))
+            if debug_mode and msg["role"] == "assistant":
+                dbg_idx = i // 2
+                if dbg_idx < len(st.session_state.debug_data):
+                    with st.expander("🔬 Debug: intent mapping & raw API data", expanded=False):
+                        st.json(st.session_state.debug_data[dbg_idx])
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Input area ──
+    st.markdown("---")
+    col_input, col_btn = st.columns([5, 1])
+    with col_input:
+        user_input = st.text_input(
+            "Ask a question",
+            placeholder="e.g. How many users had GPS issues last week?",
+            label_visibility="collapsed",
+            key="user_input_field",
+            value=st.session_state.pop("pending_query", ""),
+        )
+    with col_btn:
+        send_clicked = st.button("Send ➤", use_container_width=True, key="send_btn")
+
+    # ── Process query ──
+    if (send_clicked or user_input) and user_input.strip():
+        query = user_input.strip()
+
+        if not api_key:
+            st.error("⚠️ Please enter your Gemini API key in the sidebar before sending a message.")
+            return
+
+        ts_now = datetime.now().strftime("%H:%M")
+        st.session_state.messages.append({"role": "user", "content": query, "ts": ts_now})
+
+        client = make_gemini_client(api_key)
+
+        pipeline_status = st.empty()
+        stream_area    = st.empty()   # live streaming output lands here
+
+        def update_status(step: str, msg: str):
+            colors = {"step1": "#ffa657", "step2": "#3b82f6", "step3": "#10b981"}
+            icons  = {"step1": "🔍",      "step2": "📡",      "step3": "✨"}
+            color  = colors.get(step, "#9ca3af")
+            icon   = icons.get(step, "⚙️")
+            pipeline_status.markdown(
+                f"""<div class="pipeline-step">
+                        <div class="step-dot" style="background:{color};"></div>
+                        <span style="color:{color};font-size:0.82rem;font-weight:500;">{icon} {msg}</span>
+                    </div>""",
+                unsafe_allow_html=True,
+            )
+
+        try:
+            answer, debug_info = run_pipeline(
+                client=client,
+                user_query=query,
+                tenant_id=tenant_id,
+                date_range_days=date_range_days,
+                page_size=page_size,
+                status_callback=update_status,
+                stream_placeholder=stream_area,
+                force_cached=force_cached,
+            )
+        except Exception as exc:  # noqa: BLE001
+            pipeline_status.empty()
+            stream_area.empty()
+            err = str(exc)
+            if "API_KEY" in err.upper() or "api key" in err.lower() or "401" in err:
+                st.error("❌ Invalid Gemini API key. Please check your key in the sidebar.")
+            elif "quota" in err.lower() or "429" in err:
+                st.error("❌ Gemini quota exceeded. Please wait a moment and try again.")
+            else:
+                st.error(f"❌ An unexpected error occurred: {exc}")
+            return
+
+        pipeline_status.empty()
+        stream_area.empty()
+
+        # Find overall data source used in execution
+        data_source = get_overall_data_source(debug_info.get("api_data", {}))
+
+        st.session_state.messages.append({
+            "role": "assistant", 
+            "content": answer, 
+            "ts": ts_now,
+            "data_source": data_source
+        })
+        st.session_state.debug_data.append(debug_info)
+        st.rerun()
+
+
+if __name__ == "__main__":
+    main()
