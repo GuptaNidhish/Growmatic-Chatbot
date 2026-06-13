@@ -415,4 +415,119 @@ Return JSON only."""
             raw = raw[4:]
     return json.loads(raw)
 
+def fetch_api_data(
+    endpoint_keys: list[str],
+    tenant_id: str,
+    date_range_days: int,
+    page_size: int = 50,
+    force_cached: bool = False,
+) -> dict[str, Any]:
+    """Call each required endpoint with session cookies and return raw data.
+    Falls back to cached JSON files if live requests fail or return internal database errors.
+    """
+    results: dict[str, Any] = {}
+    
+    if force_cached:
+        for key in endpoint_keys:
+            mock_data = load_mock_data(key)
+            if isinstance(mock_data, dict):
+                mock_data["__data_source__"] = "cached"
+            results[key] = _trim_ids(mock_data)
+        return results
 
+    date_payload = _date_range_payload(date_range_days)
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+
+    # Define endpoints mapping explicitly to make requests extremely robust
+    # POST endpoints matching analytical queries
+    post_anal_endpoints = {
+        "high_battery_usage_count", "good_usage_onoff_duty_count", "missing_gps_sessions",
+        "app_version_use_count", "good_distance_sessions_count", "start_with_low_battery_count",
+        "most_on_duty_users"
+    }
+    # POST endpoints matching events logs
+    post_event_endpoints = {"notification_events", "missing_gps_events", "bad_app_settings"}
+
+    for key in endpoint_keys:
+        url = APIS.get(key)
+        if not url:
+            results[key] = {"error": f"Unknown endpoint key: {key}", "__data_source__": "error"}
+            continue
+
+        resp_json = None
+        data_source = "live"
+
+        try:
+            # 1. Dispatch request with correct HTTP method & payload structure
+            if key in post_anal_endpoints:
+                payload = {"tenantId": str(tenant_id), **date_payload}
+                resp = requests.post(url, json=payload, headers=headers, cookies=COOKIES, timeout=15)
+            elif key in post_event_endpoints:
+                payload = {"tenantId": str(tenant_id), **date_payload, "page": 1, "limit": page_size}
+                resp = requests.post(url, json=payload, headers=headers, cookies=COOKIES, timeout=15)
+            elif key == "cumulative_tenant_count_history":
+                payload = date_payload.copy()
+                resp = requests.post(url, json=payload, headers=headers, cookies=COOKIES, timeout=15)
+            elif key == "all_tenants":
+                resp = requests.post(url, json={}, headers=headers, cookies=COOKIES, timeout=15)
+            elif key == "last_synced":
+                try:
+                    tid_val = int(tenant_id)
+                except ValueError:
+                    tid_val = tenant_id
+                payload = {"tenantId": tid_val, "order": [], "skip": 0, "limit": page_size}
+                resp = requests.post(url, json=payload, headers=headers, cookies=COOKIES, timeout=15)
+            else:
+                # GET endpoints: tenant, user_profile, tenant_config_count, tenant_list
+                resp = requests.get(url, headers=headers, cookies=COOKIES, timeout=15)
+
+            resp.raise_for_status()
+            resp_json = resp.json()
+
+            # 2. Check for backend database/TypeError bugs inside successful response
+            is_internal_error = False
+            if isinstance(resp_json, dict):
+                if resp_json.get("result") == -1 or "errorMessage" in resp_json:
+                    is_internal_error = True
+                elif "message" in resp_json and ("Error" in str(resp_json["message"]) or "property" in str(resp_json["message"])):
+                    is_internal_error = True
+
+            if is_internal_error:
+                raise ValueError(f"Backend SQL/Code error detected: {resp_json}")
+            
+            # Trim large payloads
+            resp_json = _trim_ids(resp_json)
+            if isinstance(resp_json, dict):
+                resp_json["__data_source__"] = "live"
+            else:
+                resp_json = {"data": resp_json, "__data_source__": "live"}
+            results[key] = resp_json
+
+        except Exception as exc:
+            # 3. Fallback to cached mock data
+            mock_data = load_mock_data(key)
+            if isinstance(mock_data, dict) and "error" not in mock_data:
+                mock_data["__data_source__"] = "cached"
+                mock_data["__live_error__"] = str(exc)
+                results[key] = _trim_ids(mock_data)
+            else:
+                results[key] = {
+                    "error": f"Live failed ({exc}) and cached file missing: {mock_data.get('error', '')}",
+                    "__data_source__": "error"
+                }
+
+    return results
+def _trim_ids(obj: Any, max_ids: int = 10) -> Any:
+    """Recursively truncate long id arrays to keep LLM context manageable."""
+    if isinstance(obj, dict):
+        trimmed = {}
+        for k, v in obj.items():
+            if k in {"ids", "uniqueUserIds", "uniqueUsersIds", "totalCountIds"} \
+                    and isinstance(v, list) and len(v) > max_ids:
+                trimmed[k] = v[:max_ids] + [f"... ({len(v) - max_ids} more)"]
+            else:
+                trimmed[k] = _trim_ids(v, max_ids)
+        return trimmed
+    if isinstance(obj, list):
+        return [_trim_ids(item, max_ids) for item in obj]
+    return obj
